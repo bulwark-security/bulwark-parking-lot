@@ -175,8 +175,8 @@ impl PluginCtx {
     /// # Arguments
     ///
     /// * `plugin` - The [`Plugin`] and its associated configuration.
+    /// * `environment` - The environment variables to make available to the plugin.
     /// * `redis_ctx` - The Redis connection pool.
-    /// * `http_client` - The HTTP client used for outbound requests.
     pub fn new(
         plugin: Arc<Plugin>,
         environment: HashMap<String, String>,

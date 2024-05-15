@@ -1,5 +1,4 @@
 use anyhow::Context as _;
-use wasmtime_wasi_http::body::HyperIncomingBody;
 
 mod latest {
     pub mod http {
@@ -27,22 +26,19 @@ pub(crate) mod bindings {
     });
 }
 
-use {
-    crate::PluginCtx,
-    crate::{PluginExecutionError, PluginInstantiationError, PluginLoadError},
-    bulwark_sdk::Decision,
-    http_body_util::{combinators::BoxBody, BodyExt, Empty, Full},
-    std::{
-        collections::{HashMap, HashSet},
-        net::IpAddr,
-        path::Path,
-        sync::Arc,
-    },
-    wasmtime::component::{Component, Linker},
-    wasmtime::{AsContextMut, Config, Engine, Store},
-    wasmtime_wasi::{pipe::MemoryOutputPipe, HostOutputStream, StdoutStream},
-    wasmtime_wasi_http::WasiHttpView,
-};
+use crate::{PluginCtx, RedisCtx};
+use crate::{PluginExecutionError, PluginInstantiationError, PluginLoadError, PluginPoolError};
+use bulwark_sdk::Decision;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::path::Path;
+use std::sync::Arc;
+use wasmtime::component::{Component, Linker};
+use wasmtime::{AsContextMut, Config, Engine, Store};
+use wasmtime_wasi::{pipe::MemoryOutputPipe, HostOutputStream, StdoutStream};
+use wasmtime_wasi_http::body::HyperIncomingBody;
+use wasmtime_wasi_http::WasiHttpView;
 
 extern crate redis;
 
@@ -183,6 +179,11 @@ impl Plugin {
         })
     }
 
+    /// Returns the plugin's reference ID.
+    pub fn reference(&self) -> &str {
+        self.reference.as_str()
+    }
+
     /// Makes the host's configuration available to host functions.
     pub(crate) fn host_config(&self) -> &bulwark_config::Config {
         &self.host_config
@@ -196,6 +197,45 @@ impl Plugin {
     /// Makes the permissions the plugin has been granted available to the guest environment.
     pub fn permissions(&self) -> &bulwark_config::Permissions {
         &self.guest_config.permissions
+    }
+}
+
+pub type InstancePool = deadpool::managed::Pool<PluginManager>;
+pub type PluginInstanceObj = deadpool::managed::Object<PluginManager>;
+
+/// Manages the creation and recycling of `PluginInstance`s for a single `Plugin`.
+pub struct PluginManager {
+    pub plugin: Arc<Plugin>,
+    pub environment: HashMap<String, String>,
+    pub redis_ctx: RedisCtx,
+}
+
+impl deadpool::managed::Manager for PluginManager {
+    type Type = PluginInstance;
+
+    type Error = PluginPoolError;
+
+    async fn create(&self) -> Result<Self::Type, Self::Error> {
+        Ok(PluginInstance::new(
+            self.plugin.clone(),
+            PluginCtx::new(
+                self.plugin.clone(),
+                self.environment.clone(),
+                self.redis_ctx.clone(),
+            )?,
+        )
+        .await?)
+    }
+
+    async fn recycle(
+        &self,
+        _: &mut Self::Type,
+        _: &deadpool_redis::Metrics,
+    ) -> deadpool::managed::RecycleResult<Self::Error> {
+        // TODO: Implement health check
+        // TODO: Do we need to health check every time or just periodically?
+        // TODO: Recycle if instance is configurably too old?
+        Ok(())
     }
 }
 

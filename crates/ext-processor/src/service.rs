@@ -1,12 +1,12 @@
 //! The service module contains the main Envoy external processor service implementation.
 
-use crate::{PluginGroupInstantiationError, ProcessingMessageError, RequestError, ResponseError};
+use crate::{ProcessingMessageError, RequestError, ResponseError};
 use bulwark_config::Config;
 use bulwark_sdk::Verdict;
 
 use bulwark_host::{
-    ForwardedIP, HandlerOutput, Plugin, PluginCtx, PluginExecutionError, PluginInstance,
-    PluginLoadError, RedisCtx, ScriptRegistry,
+    ForwardedIP, HandlerOutput, InstancePool, Plugin, PluginExecutionError, PluginInstanceObj,
+    PluginLoadError, PluginManager, PluginReferenceError, RedisCtx, ScriptRegistry,
 };
 use bulwark_sdk::Decision;
 use envoy_control_plane::envoy::{
@@ -99,11 +99,11 @@ async fn join_all<T, F>(
 pub struct BulwarkProcessor {
     // TODO: may need to have a plugin registry at some point
     router: Arc<RwLock<Router<RouteTarget>>>,
-    redis_ctx: RedisCtx,
     request_semaphore: Arc<tokio::sync::Semaphore>,
     plugin_semaphore: Arc<tokio::sync::Semaphore>,
     thresholds: bulwark_config::Thresholds,
     proxy_hops: usize,
+    plugin_pools: HashMap<String, Arc<InstancePool>>,
     // TODO: redis circuit breaker for health monitoring
 }
 
@@ -117,7 +117,9 @@ impl ExternalProcessor for BulwarkProcessor {
         &self,
         tonic_request: tonic::Request<Streaming<ProcessingRequest>>,
     ) -> Result<tonic::Response<ExternalProcessorStream>, tonic::Status> {
+        // TODO: figure out how to avoid the self-clone
         let bulwark_processor = self.clone();
+        let router = self.router.clone();
         let thresholds = self.thresholds;
         let proxy_hops = self.proxy_hops;
         let plugin_semaphore = self.plugin_semaphore.clone();
@@ -156,7 +158,7 @@ impl ExternalProcessor for BulwarkProcessor {
                             .map(|ua: &http::HeaderValue| ua.to_str().unwrap_or_default())
                     );
 
-                    let router = bulwark_processor.router.read().await;
+                    let router = router.read().await;
                     let route_result = router.at(request.uri().path());
                     // TODO: router needs to point to a struct that bundles the plugin set and associated config like timeout duration
                     // TODO: put default timeout in a constant somewhere central
@@ -171,12 +173,20 @@ impl ExternalProcessor for BulwarkProcessor {
 
                             let route_target = route_match.value;
                             // TODO: figure out how best to bubble the error out of the task and up to the parent
-                            // TODO: figure out if tonic-error or some other option is the best way to convert to a tonic Status error
-                            // TODO: we probably want to be initializing only when necessary now rather than on every request
-                            let plugin_instances = bulwark_processor
-                                .instantiate_plugins(&route_target.plugins)
+                            let instance_pools = bulwark_processor
+                                .plugin_instance_pools(&route_target.plugins)
                                 .await
                                 .unwrap();
+                            let plugin_instances: Vec<Arc<Mutex<PluginInstanceObj>>> =
+                                futures::future::join_all(
+                                    instance_pools
+                                        .iter()
+                                        .map(|pool| async {
+                                            Arc::new(Mutex::new(pool.get().await.unwrap()))
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                                .await;
                             if let Some(millis) = route_match.value.timeout {
                                 timeout_duration = Duration::from_millis(millis);
                             }
@@ -269,6 +279,8 @@ impl BulwarkProcessor {
             registry: Arc::new(ScriptRegistry::default()),
         };
 
+        let mut plugin_pools: HashMap<String, Arc<InstancePool>> = HashMap::new();
+
         let mut router: Router<RouteTarget> = Router::new();
         if config.resources.is_empty() {
             // TODO: return an init error not a plugin load error
@@ -284,8 +296,37 @@ impl BulwarkProcessor {
                     path = plugin_config.path,
                     resource = resource.route
                 );
-                let plugin = Plugin::from_file(plugin_config.path.clone(), &config, plugin_config)?;
-                plugins.push(Arc::new(plugin));
+                let plugin = Arc::new(Plugin::from_file(
+                    plugin_config.path.clone(),
+                    &config,
+                    plugin_config,
+                )?);
+                plugins.push(plugin.clone());
+
+                let mut environment = HashMap::new();
+                for key in &plugin.permissions().env {
+                    match std::env::var(key) {
+                        Ok(value) => {
+                            environment.insert(key.clone(), value);
+                        }
+                        Err(err) => {
+                            warn!("plugin requested environment variable '{}' but it could not be provided: {}", key, err);
+                        }
+                    }
+                }
+                let plugin_manager = PluginManager {
+                    plugin: plugin.clone(),
+                    environment,
+                    redis_ctx: redis_ctx.clone(),
+                };
+
+                let pool = Arc::new(
+                    deadpool::managed::Pool::builder(plugin_manager)
+                        .max_size(config.runtime.max_concurrent_requests)
+                        .build()?,
+                );
+
+                plugin_pools.insert(plugin.reference().to_string(), pool.clone());
             }
             router
                 .insert(
@@ -304,38 +345,26 @@ impl BulwarkProcessor {
             plugin_semaphore: Arc::new(Semaphore::new(config.runtime.max_plugin_tasks)),
             thresholds: config.thresholds,
             proxy_hops: usize::from(config.service.proxy_hops),
-            redis_ctx,
+            plugin_pools,
         })
     }
 
-    async fn instantiate_plugins(
+    async fn plugin_instance_pools(
         &self,
         plugins: &PluginList,
-    ) -> Result<Vec<Arc<Mutex<PluginInstance>>>, PluginGroupInstantiationError> {
-        let mut plugin_instances = Vec::with_capacity(plugins.len());
+    ) -> Result<Vec<Arc<InstancePool>>, PluginReferenceError> {
+        let mut plugin_pools = Vec::with_capacity(plugins.len());
         for plugin in plugins {
-            let mut environment = HashMap::new();
-            for key in &plugin.permissions().env {
-                match std::env::var(key) {
-                    Ok(value) => {
-                        environment.insert(key.clone(), value);
-                    }
-                    Err(err) => {
-                        warn!("plugin requested environment variable '{}' but it could not be provided: {}", key, err);
-                    }
-                }
-            }
-            let request_context =
-                PluginCtx::new(plugin.clone(), environment, self.redis_ctx.clone())?;
-            plugin_instances.push(Arc::new(Mutex::new(
-                PluginInstance::new(plugin.clone(), request_context).await?,
-            )));
+            let instance_pool = self.plugin_pools.get(plugin.reference()).ok_or(
+                PluginReferenceError::MissingReference(plugin.reference().to_string()),
+            )?;
+            plugin_pools.push(instance_pool.clone());
         }
-        Ok(plugin_instances)
+        Ok(plugin_pools)
     }
 
     async fn dispatch_init(
-        plugin_instance: Arc<Mutex<PluginInstance>>,
+        plugin_instance: Arc<Mutex<PluginInstanceObj>>,
     ) -> Result<(), PluginExecutionError> {
         let mut plugin_instance = plugin_instance.lock().await;
         let result = plugin_instance.handle_init().await;
@@ -355,7 +384,7 @@ impl BulwarkProcessor {
     }
 
     async fn dispatch_request_enrichment(
-        plugin_instance: Arc<Mutex<PluginInstance>>,
+        plugin_instance: Arc<Mutex<PluginInstanceObj>>,
         request: Arc<bulwark_sdk::Request>,
         labels: HashMap<String, String>,
     ) -> Result<HashMap<String, String>, PluginExecutionError> {
@@ -379,7 +408,7 @@ impl BulwarkProcessor {
     }
 
     async fn dispatch_request_decision(
-        plugin_instance: Arc<Mutex<PluginInstance>>,
+        plugin_instance: Arc<Mutex<PluginInstanceObj>>,
         request: Arc<bulwark_sdk::Request>,
         labels: HashMap<String, String>,
     ) -> Result<HandlerOutput, PluginExecutionError> {
@@ -403,7 +432,7 @@ impl BulwarkProcessor {
     }
 
     async fn dispatch_response_decision(
-        plugin_instance: Arc<Mutex<PluginInstance>>,
+        plugin_instance: Arc<Mutex<PluginInstanceObj>>,
         request: Arc<bulwark_sdk::Request>,
         response: Arc<bulwark_sdk::Response>,
         labels: HashMap<String, String>,
@@ -428,7 +457,7 @@ impl BulwarkProcessor {
     }
 
     async fn dispatch_decision_feedback(
-        plugin_instance: Arc<Mutex<PluginInstance>>,
+        plugin_instance: Arc<Mutex<PluginInstanceObj>>,
         request: Arc<bulwark_sdk::Request>,
         response: Arc<bulwark_sdk::Response>,
         labels: HashMap<String, String>,
@@ -459,7 +488,7 @@ struct ProcessorContext {
     sender: Arc<Mutex<UnboundedSender<Result<ProcessingResponse, tonic::Status>>>>,
     stream: Arc<Mutex<Streaming<ProcessingRequest>>>,
     plugin_semaphore: Arc<tokio::sync::Semaphore>,
-    plugin_instances: Vec<Arc<Mutex<PluginInstance>>>,
+    plugin_instances: Vec<Arc<Mutex<PluginInstanceObj>>>,
     router_labels: HashMap<String, String>,
     request: Arc<bulwark_sdk::Request>,
     response: Option<Arc<bulwark_sdk::Response>>,

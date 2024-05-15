@@ -1,20 +1,6 @@
-use bulwark_host::{ContextInstantiationError, PluginInstantiationError};
-
-/// Returned when trying to instantiate a plugin group and either the request context for a plugin or the plugin
-/// itself returns an instantiation error.
-#[derive(thiserror::Error, Debug)]
-pub enum PluginGroupInstantiationError {
-    #[error(transparent)]
-    ContextInstantiation(#[from] ContextInstantiationError),
-    #[error(transparent)]
-    PluginInstantiation(#[from] PluginInstantiationError),
-}
-
 /// Returned when the Envoy external processor is unable to handle an incoming message successfully.
 #[derive(thiserror::Error, Debug)]
 pub enum HandlerError {
-    #[error(transparent)]
-    PluginInstantiation(#[from] PluginGroupInstantiationError),
     #[error(transparent)]
     Request(#[from] RequestError),
     #[error(transparent)]

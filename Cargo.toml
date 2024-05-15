@@ -119,6 +119,7 @@ forwarded-header-value = "0.1.1"
 futures = "0.3"
 http = "1.0"
 metrics = "0.21.1"
+deadpool = "0.12.1"
 deadpool-redis = "0.15.0"
 redis = { version = "0.25", features = [
     "tokio-comp",
